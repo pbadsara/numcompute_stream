@@ -126,3 +126,244 @@ class _Node:
         self.left = left
         self.right = right
 
+
+class HoeffdingTreeClassifier:
+    """Depth-limited streaming decision tree.
+    """
+
+    def __init__(self, max_depth=8, min_samples_split=60, max_features=None,
+                 criterion="gini", delta=0.05, tau=0.05, n_candidates=10,
+                 random_state=None):
+        if criterion not in {"gini", "entropy"}:
+            raise ValueError("criterion must be 'gini' or 'entropy'.")
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.max_features = max_features
+        self.criterion = criterion
+        self.delta = delta
+        self.tau = tau
+        self.n_candidates = n_candidates
+        self.random_state = random_state
+        self._rng = np.random.default_rng(random_state)
+        self.classes_ = None
+        self._cls_index: dict = {}
+        self.n_features_ = None
+        self.root: _Leaf | _Node | None = None
+
+    # -- class bookkeeping ---------------------------------------------------
+    def _register_classes(self, y):
+        for c in np.unique(y):
+            c = c.item()
+            if c not in self._cls_index:
+                self._cls_index[c] = len(self._cls_index)
+        self.classes_ = np.array(
+            [k for k, _ in sorted(self._cls_index.items(), key=lambda kv: kv[1])]
+        )
+
+    def _encode(self, y):
+        return np.array([self._cls_index[v.item()] for v in np.asarray(y)])
+
+    def _n_classes(self):
+        return len(self._cls_index)
+
+    def _max_feats(self):
+        d = self.n_features_
+        if self.max_features is None:
+            return d
+        if self.max_features == "sqrt":
+            return max(1, int(np.sqrt(d)))
+        if self.max_features == "log2":
+            return max(1, int(np.log2(d)))
+        return min(int(self.max_features), d)
+
+    # -- routing -------------------------------------------------------------
+    def _collect(self, X):
+        """Partition row indices to their leaves (vectorised descent)."""
+        out = []
+
+        def rec(node, idx):
+            if isinstance(node, _Leaf):
+                out.append((node, idx))
+                return
+            xj = X[idx, node.feature]
+            left = ~(xj > node.threshold)  # NaN -> left
+            rec(node.left, idx[left])
+            rec(node.right, idx[~left])
+
+        rec(self.root, np.arange(X.shape[0]))
+        return out
+
+    # -- splitting -----------------------------------------------------------
+    def _best_split(self, leaf: _Leaf):
+        """Return (gain1, gain2, feature, threshold, left_counts, right_counts)."""
+        counts = leaf.n_class
+        K = counts.size
+        N = counts.sum()
+        parent_imp = _impurity(counts, self.criterion)
+        feats = self._rng.choice(self.n_features_, size=self._max_feats(),
+                                 replace=False)
+        best = (-np.inf, None, None, None, None)
+        second = -np.inf
+        for j in feats:
+            lo, hi = leaf.fmin[j], leaf.fmax[j]
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                continue
+            thr = np.linspace(lo, hi, self.n_candidates + 2)[1:-1]  # (T,)
+            mean = leaf.stat_mean[:, j]  # (K,)
+            var = np.divide(leaf.stat_M2[:, j], np.maximum(leaf.stat_n[:, j] - 1, 0),
+                            out=np.zeros(K), where=leaf.stat_n[:, j] > 1)
+            std = np.sqrt(np.maximum(var, 1e-12))
+            # P(x <= t | class) for every threshold/class -> (T, K)
+            z = (thr[:, None] - mean[None, :]) / std[None, :]
+            cdf = _norm_cdf(z)
+            left = cdf * counts[None, :]  # (T, K)
+            right = counts[None, :] - left
+            nL = left.sum(1)
+            nR = right.sum(1)
+            valid = (nL > 0) & (nR > 0)
+            if not valid.any():
+                continue
+            impL = _impurity(left, self.criterion)
+            impR = _impurity(right, self.criterion)
+            gain = parent_imp - (nL / N * impL + nR / N * impR)
+            gain = np.where(valid, gain, -np.inf)
+            t_idx = int(np.argmax(gain))
+            g = gain[t_idx]
+            if g > best[0]:
+                second = best[0] if best[0] > -np.inf else second
+                best = (g, j, float(thr[t_idx]), left[t_idx], right[t_idx])
+            elif g > second:
+                second = g
+        return best, second
+
+    def _attempt_split(self, leaf: _Leaf):
+        if leaf.depth >= self.max_depth:
+            return None
+        if leaf.total() < self.min_samples_split:
+            return None
+        leaf.seen_since_eval = 0.0
+        (g1, j, thr, left_counts, right_counts), g2 = self._best_split(leaf)
+        if j is None or g1 <= 0:
+            return None
+        n = leaf.total()
+        R = 1.0 if self.criterion == "gini" else np.log(max(self._n_classes(), 2))
+        eps = np.sqrt(R * R * np.log(1.0 / self.delta) / (2.0 * n))
+        if (g1 - g2) > eps or eps < self.tau:
+            K, d = self._n_classes(), self.n_features_
+            lc = np.zeros(K)
+            rc = np.zeros(K)
+            lc[: left_counts.size] = np.round(left_counts)
+            rc[: right_counts.size] = np.round(right_counts)
+            return _Node(
+                feature=j,
+                threshold=thr,
+                left=_Leaf(leaf.depth + 1, K, d, lc),
+                right=_Leaf(leaf.depth + 1, K, d, rc),
+            )
+        return None
+
+    def _grow(self):
+        """Walk the tree and replace any splittable leaf with a decision node."""
+        def rec(node):
+            if isinstance(node, _Leaf):
+                return self._attempt_split(node) or node
+            node.left = rec(node.left)
+            node.right = rec(node.right)
+            return node
+
+        self.root = rec(self.root)
+
+    # -- public API ----------------------------------------------------------
+    def partial_fit(self, X, y, classes=None) -> "HoeffdingTreeClassifier":
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        y = np.asarray(y).ravel()
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"X has {X.shape[0]} rows but y has {y.shape[0]} labels."
+            )
+        if classes is not None:
+            self._register_classes(np.asarray(classes))
+        self._register_classes(y)
+        if self.n_features_ is None:
+            self.n_features_ = X.shape[1]
+        elif X.shape[1] != self.n_features_:
+            raise ValueError(
+                f"expected {self.n_features_} features, got {X.shape[1]}."
+            )
+        # grow class-count arrays if new classes appeared since the last chunk
+        if self.root is None:
+            self.root = _Leaf(0, self._n_classes(), self.n_features_)
+        self._resize_leaves(self.root)
+
+        yc = self._encode(y)
+        for leaf, idx in self._collect(X):
+            if idx.size:
+                leaf.update(X[idx], yc[idx])
+        self._grow()
+        return self
+
+    def _resize_leaves(self, node):
+        """Pad per-leaf class arrays after new classes are discovered."""
+        K = self._n_classes()
+
+        def rec(n):
+            if isinstance(n, _Leaf):
+                if n.n_class.size < K:
+                    pad = K - n.n_class.size
+                    n.n_class = np.concatenate([n.n_class, np.zeros(pad)])
+                    n.stat_n = np.vstack([n.stat_n, np.zeros((pad, self.n_features_))])
+                    n.stat_mean = np.vstack([n.stat_mean,
+                                             np.zeros((pad, self.n_features_))])
+                    n.stat_M2 = np.vstack([n.stat_M2,
+                                           np.zeros((pad, self.n_features_))])
+            else:
+                rec(n.left)
+                rec(n.right)
+
+        rec(node)
+
+    def fit(self, X, y, classes=None) -> "HoeffdingTreeClassifier":
+        self.__init__(self.max_depth, self.min_samples_split, self.max_features,
+                      self.criterion, self.delta, self.tau, self.n_candidates,
+                      self.random_state)
+        return self.partial_fit(X, y, classes)
+
+    def predict_proba(self, X) -> np.ndarray:
+        if self.root is None:
+            raise RuntimeError("tree is not fitted.")
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        K = self._n_classes()
+        proba = np.zeros((X.shape[0], K))
+        for leaf, idx in self._collect(X):
+            if not idx.size:
+                continue
+            counts = leaf.n_class[:K]
+            tot = counts.sum()
+            row = counts / tot if tot > 0 else np.full(K, 1.0 / K)
+            proba[idx] = row
+        return proba
+
+    def predict(self, X) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
+
+    def score(self, X, y) -> float:
+        y = np.asarray(y).ravel()
+        return float(np.mean(self.predict(X) == y))
+
+    def n_leaves(self) -> int:
+        def rec(n):
+            return 1 if isinstance(n, _Leaf) else rec(n.left) + rec(n.right)
+
+        return rec(self.root) if self.root is not None else 0
+
+    def depth(self) -> int:
+        def rec(n, d):
+            return d if isinstance(n, _Leaf) else max(rec(n.left, d + 1),
+                                                      rec(n.right, d + 1))
+
+        return rec(self.root, 0) if self.root is not None else 0
+
+
+# Public alias matching the specification's class name.
+DecisionTreeClassifier = HoeffdingTreeClassifier
