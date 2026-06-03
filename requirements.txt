@@ -1,0 +1,12 @@
+# Runtime dependencies (computation is NumPy-only; matplotlib for visualise.py)
+numpy>=1.23
+matplotlib>=3.5
+
+# Development / demo only (NOT used by the framework itself)
+pytest>=7.0
+jupyter
+nbclient
+ipykernel
+
+# scikit-learn and pandas NOT being installed or imported by this framework.
+# All ML and data handling is implemented from scratch using NumPy + stdlib only.

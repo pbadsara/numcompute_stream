@@ -1,2 +1,4 @@
-# numcompute_stream
-This is a github repo to build a a streaming, decision tree–based machine learning framework that also supports ensemble method from scratch
+## NumCompute-Stream
+
+A **NumPy-only** streaming machine-learning framework built around incremental,
+tree-based classifiers, supporting ensemble method from scratch
